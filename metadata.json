@@ -1,0 +1,7 @@
+{
+  "name": "Dermaguard",
+  "description": "AI-based cosmetic allergy detection system.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
