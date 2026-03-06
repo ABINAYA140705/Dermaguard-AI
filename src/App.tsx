@@ -223,9 +223,30 @@ const Questionnaire = ({ onComplete }: { onComplete: (type: SkinType) => void })
   const [currentStep, setCurrentStep] = useState(0);
   const [answers, setAnswers] = useState<string[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  
+  // Camera state
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   const skinTypes: SkinType[] = ['Normal', 'Dry', 'Oily', 'Combination', 'Sensitive', 'Acne-prone'];
+
+  // Clean up camera on unmount or mode change
+  useEffect(() => {
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, [mode]);
+
+  // Attach stream to video element once it renders
+  useEffect(() => {
+    if (isCameraActive && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+    }
+  }, [isCameraActive]);
 
   const handleAnswer = (category: string) => {
     const newAnswers = [...answers, category];
@@ -240,52 +261,104 @@ const Questionnaire = ({ onComplete }: { onComplete: (type: SkinType) => void })
     }
   };
 
-  const handleSelfieUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      streamRef.current = stream;
+      setIsCameraActive(true); // This triggers the render of the video element
+    } catch (err) {
+      console.error("Error accessing camera:", err);
+      alert("Could not access the camera. Please ensure you have granted permission.");
+    }
+  };
+
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    setIsCameraActive(false);
+  };
+
+  const captureAndAnalyze = async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+      alert("Camera is still initializing. Please wait a moment and try again.");
+      return;
+    }
+
+    // Scale down image to prevent API payload size errors
+    const MAX_DIMENSION = 1024;
+    let width = video.videoWidth;
+    let height = video.videoHeight;
+
+    if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+      const ratio = Math.min(MAX_DIMENSION / width, MAX_DIMENSION / height);
+      width = Math.round(width * ratio);
+      height = Math.round(height * ratio);
+    }
+    
+    // Set canvas dimensions
+    canvas.width = width;
+    canvas.height = height;
+    
+    // Draw current frame to canvas
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.drawImage(video, 0, 0, width, height);
+    
+    // Get base64 image data (JPEG format)
+    const imageDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+    const base64Data = imageDataUrl.split(',')[1];
+
+    if (!base64Data || base64Data.length < 100) {
+      alert("Failed to capture image. Please try again.");
+      return;
+    }
 
     setIsAnalyzing(true);
+    stopCamera(); // Stop camera while analyzing
+
     try {
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) throw new Error("API Key missing");
 
       const ai = new GoogleGenAI({ apiKey });
-      const reader = new FileReader();
-      reader.onloadend = async () => {
-        const base64Data = (reader.result as string).split(',')[1];
-        
-        const response = await ai.models.generateContent({
-          model: 'gemini-3-flash-preview',
-          contents: {
-            parts: [
-              {
-                inlineData: {
-                  data: base64Data,
-                  mimeType: file.type,
-                },
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                data: base64Data,
+                mimeType: 'image/jpeg',
               },
-              {
-                text: 'Analyze this selfie for skin type. Look for shine (oily), redness (sensitive), flakiness (dry), breakouts (acne-prone), or balanced/smooth (Normal). Return ONLY one of these exact words: Dry, Oily, Sensitive, Combination, Acne-prone, Normal.',
-              },
-            ],
-          },
-        });
-        
-        const result = response.text?.trim() as SkinType;
-        if (['Dry', 'Oily', 'Sensitive', 'Combination', 'Acne-prone', 'Normal'].includes(result)) {
-          onComplete(result);
-        } else {
-          // Fallback if AI is confused
-          onComplete('Normal');
-        }
-        setIsAnalyzing(false);
-      };
-      reader.readAsDataURL(file);
+            },
+            {
+              text: 'Analyze this selfie for skin type. Look for shine (oily), redness (sensitive), flakiness (dry), breakouts (acne-prone), or balanced/smooth (Normal). Return ONLY one of these exact words: Dry, Oily, Sensitive, Combination, Acne-prone, Normal.',
+            },
+          ],
+        },
+      });
+      
+      const result = response.text?.trim() as SkinType;
+      if (['Dry', 'Oily', 'Sensitive', 'Combination', 'Acne-prone', 'Normal'].includes(result)) {
+        onComplete(result);
+      } else {
+        // Fallback if AI is confused
+        onComplete('Normal');
+      }
     } catch (error) {
       console.error(error);
-      setIsAnalyzing(false);
       alert("Selfie analysis failed. Please try the quiz instead.");
       setMode('quiz');
+    } finally {
+      setIsAnalyzing(false);
     }
   };
 
@@ -359,36 +432,56 @@ const Questionnaire = ({ onComplete }: { onComplete: (type: SkinType) => void })
           <div className="w-20 h-20 bg-teal-50 rounded-full flex items-center justify-center mx-auto mb-6">
             <Camera className="text-teal-600 w-10 h-10" />
           </div>
-          <h2 className="text-2xl font-bold text-slate-800 mb-2">Selfie Analysis</h2>
-          <p className="text-slate-500 mb-8">Please upload a clear photo of your face in natural light for the best results.</p>
+          <h2 className="text-2xl font-bold text-slate-800 mb-2">Live Selfie Scan</h2>
+          <p className="text-slate-500 mb-8">Position your face in the camera frame in natural light for the best results.</p>
           
-          <input 
-            type="file" 
-            ref={fileInputRef}
-            onChange={handleSelfieUpload}
-            accept="image/*"
-            capture="user"
-            className="hidden"
-          />
-
-          <button 
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isAnalyzing}
-            className="w-full bg-teal-600 hover:bg-teal-700 disabled:bg-slate-300 text-white font-bold py-4 rounded-2xl shadow-lg shadow-teal-200 transition-all flex items-center justify-center gap-2 mb-4"
-          >
+          <div className="relative w-full aspect-[3/4] bg-slate-100 rounded-2xl overflow-hidden mb-6 flex items-center justify-center shadow-inner">
             {isAnalyzing ? (
-              <>
-                <RefreshCw className="w-5 h-5 animate-spin" /> Analyzing Skin...
-              </>
+               <div className="flex flex-col items-center justify-center text-teal-600">
+                 <RefreshCw className="w-8 h-8 animate-spin mb-2" />
+                 <span className="font-medium">Analyzing Skin...</span>
+               </div>
+            ) : isCameraActive ? (
+              <video 
+                ref={videoRef} 
+                autoPlay 
+                playsInline 
+                muted 
+                className="w-full h-full object-cover transform -scale-x-100" 
+              />
             ) : (
-              <>
-                <Upload className="w-5 h-5" /> Upload Selfie
-              </>
+              <div className="text-slate-400 flex flex-col items-center">
+                <Camera className="w-12 h-12 mb-2 opacity-50" />
+                <span>Camera off</span>
+              </div>
             )}
-          </button>
+            {/* Hidden canvas for capturing the frame */}
+            <canvas ref={canvasRef} className="hidden" />
+          </div>
+
+          {!isAnalyzing && (
+            isCameraActive ? (
+              <button 
+                onClick={captureAndAnalyze}
+                className="w-full bg-teal-600 hover:bg-teal-700 text-white font-bold py-4 rounded-2xl shadow-lg shadow-teal-200 transition-all flex items-center justify-center gap-2 mb-4"
+              >
+                <Camera className="w-5 h-5" /> Capture & Analyze
+              </button>
+            ) : (
+              <button 
+                onClick={startCamera}
+                className="w-full bg-slate-800 hover:bg-slate-900 text-white font-bold py-4 rounded-2xl shadow-lg transition-all flex items-center justify-center gap-2 mb-4"
+              >
+                <Camera className="w-5 h-5" /> Start Camera
+              </button>
+            )
+          )}
 
           <button 
-            onClick={() => setMode('choice')}
+            onClick={() => {
+              stopCamera();
+              setMode('choice');
+            }}
             className="text-slate-500 font-medium hover:text-teal-600 transition-colors text-sm"
           >
             Cancel and go back
