@@ -19,7 +19,7 @@ import {
   Sparkles
 } from 'lucide-react';
 import { skinTypeQuestions, ingredientDatabase, skinTypeRecommendations } from './data';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 
 // --- Types ---
 type SkinType = 'Dry' | 'Oily' | 'Sensitive' | 'Combination' | 'Acne-prone' | 'Normal' | null;
@@ -560,15 +560,127 @@ const Dashboard = ({ user, onRetake }: { user: UserProfile, onRetake: () => void
   const analyzeIngredients = async () => {
     setIsAnalyzing(true);
     try {
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ingredients, skinType: user.skinType })
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        throw new Error("Gemini API key is not configured. Please add it to your environment variables.");
+      }
+      const ai = new GoogleGenAI({ apiKey });
+      
+      const cleanedInput = ingredients
+        .replace(/\[\+\/-\:?\]/g, ",")
+        .replace(/[\[\]]/g, ",")
+        .replace(/\./g, ",")
+        .replace(/\s+/g, " ");
+
+      const ingredientList = cleanedInput
+        .split(",")
+        .map((i: string) => i.trim())
+        .filter((i: string) => i.length > 2);
+
+      const findings: any[] = [];
+      let riskScore = 0;
+      const unknownIngredients: string[] = [];
+
+      // 1. Check local database first
+      for (const userIng of ingredientList) {
+        const lowerIng = userIng.toLowerCase();
+        const dbItem = ingredientDatabase.find(item => 
+          lowerIng.includes(item.Ingredient.toLowerCase()) || 
+          item.Ingredient.toLowerCase().includes(lowerIng)
+        );
+        
+        if (dbItem) {
+          if (!findings.some(f => f.Ingredient === dbItem.Ingredient)) {
+            const isAvoid = dbItem.AvoidForSkinType.includes(user.skinType as string) || dbItem.AvoidForSkinType.includes("All");
+            findings.push({
+              ...dbItem,
+              isHarmfulForUser: isAvoid
+            });
+
+            if (isAvoid) {
+              if (dbItem.RiskLevel === "High") riskScore += 3;
+              else if (dbItem.RiskLevel === "Medium") riskScore += 2;
+              else riskScore += 1;
+            }
+          }
+        } else {
+          unknownIngredients.push(userIng);
+        }
+      }
+
+      // 2. Use Gemini API for unknown ingredients
+      if (unknownIngredients.length > 0) {
+        try {
+          const prompt = `You are a dermatological expert. Analyze these cosmetic ingredients for a user with ${user.skinType} skin:
+          ${unknownIngredients.join(", ")}
+
+          Instructions:
+          1. Identify ingredients that are harmful, irritating, or comedogenic for ${user.skinType} skin.
+          2. Even if an ingredient is "natural" (like Wheat Germ Oil), flag it if it's high-risk for this skin type (e.g., comedogenic for Oily/Acne-prone skin).
+          3. For each harmful ingredient, provide:
+             - Ingredient name
+             - Common use
+             - Possible symptoms for ${user.skinType} skin
+             - Risk Level (High, Medium, Low)
+             - A safer alternative
+          
+          Return a JSON array of objects. If none are harmful, return an empty array [].`;
+          
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    Ingredient: { type: Type.STRING },
+                    CommonUse: { type: Type.STRING },
+                    PossibleSymptoms: { type: Type.STRING },
+                    RiskLevel: { type: Type.STRING, description: "High, Medium, or Low" },
+                    SaferAlternative: { type: Type.STRING }
+                  },
+                  required: ["Ingredient", "CommonUse", "PossibleSymptoms", "RiskLevel", "SaferAlternative"]
+                }
+              }
+            }
+          });
+
+          if (response.text) {
+            const aiFindings = JSON.parse(response.text);
+            for (const item of aiFindings) {
+              if (item.RiskLevel === "High" || item.RiskLevel === "Medium") {
+                findings.push({
+                  ...item,
+                  AvoidForSkinType: [user.skinType],
+                  isHarmfulForUser: true
+                });
+                
+                if (item.RiskLevel === "High") riskScore += 3;
+                else if (item.RiskLevel === "Medium") riskScore += 2;
+                else riskScore += 1;
+              }
+            }
+          }
+        } catch (error) {
+          console.error("AI Analysis Error:", error);
+        }
+      }
+
+      let overallRisk = "Low";
+      if (riskScore >= 5) overallRisk = "High";
+      else if (riskScore >= 2) overallRisk = "Medium";
+
+      setResult({
+        overallRisk,
+        findings,
+        skinType: user.skinType
       });
-      const data = await response.json();
-      setResult(data);
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
+      alert(error.message || "Failed to analyze ingredients. Please check your API key.");
     } finally {
       setIsAnalyzing(false);
     }
